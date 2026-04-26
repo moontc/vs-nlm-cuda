@@ -7,18 +7,19 @@ on:
       - 'source/*'
       - '.github/workflows/linux.yml'
   workflow_dispatch:
+  workflow_call:
 
 jobs:
   build-linux:
     runs-on: ubuntu-24.04
     steps:
     - name: Checkout repo
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: true
 
     - name: Setup Ninja
-      run: pip3 install ninja
+      run: pip install ninja
 
     - name: Setup CUDA
       run: |
@@ -49,10 +50,20 @@ jobs:
       run: cmake --build build --config Release --verbose
 
     - name: Install
-      run: cmake --install build --prefix artifact
+      run: cmake --install build --prefix install
 
     - name: Upload
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: vs-nlm-cuda-linux
-        path: artifact
+        path: install/lib/*.so
+
+  build-wheel:
+    name: Package Wheel (Linux)
+    needs: build-linux
+    uses: ./.github/workflows/wheel.yml
+    with:
+      os: ubuntu-24.04
+      artifact_name: vs-nlm-cuda-linux
+      artifact_path: install/lib
+      build_sdist: false
