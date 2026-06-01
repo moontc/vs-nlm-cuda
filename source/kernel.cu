@@ -2,6 +2,7 @@
 
 #include "common.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <cstdint>
 #include <type_traits>
@@ -226,19 +227,20 @@ static void vertical(
     }
 }
 
-template <typename T>
+template <typename T, int num_planes>
 __global__
 __launch_bounds__(128)
-static void accumulation(
+static void accumulation_grouped(
     float * __restrict__ wdst,
     float * __restrict__ weight,
     float * __restrict__ max_weight,
     const T * __restrict__ src,
-    const float * __restrict__ buffer_bwd,
-    const float * __restrict__ buffer_fwd,
-    int width, int height, int image_stride, int buffer_stride,
-    int offset_x, int offset_y, int offset_t,
-    int num_planes
+    const float * __restrict__ buffer_bwd_base,
+    const float * __restrict__ buffer_fwd_base,
+    const int4 * __restrict__ offsets,
+    int group_start, int group_count,
+    int frame_buffer_elems,
+    int width, int height, int image_stride, int buffer_stride
 ) {
 
     int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -251,72 +253,91 @@ static void accumulation(
     auto clamp_x = [width](int coord) { return min(max(coord, 0), width - 1); };
     auto clamp_y = [height](int coord) { return min(max(coord, 0), height - 1); };
 
-    auto center_weight = buffer_bwd[y * buffer_stride + x];
-    auto mirror_weight = buffer_fwd[clamp_y(y - offset_y) * buffer_stride + clamp_x(x - offset_x)];
-    max_weight[y * buffer_stride + x] = fmaxf(max_weight[y * buffer_stride + x], fmaxf(center_weight, mirror_weight));
-    weight[y * buffer_stride + x] += center_weight + mirror_weight;
+    float weight_sum = 0.0f;
+    float max_w = 0.0f;
+    float acc[num_planes] {}; // kept in registers (num_planes is a compile-time constant)
 
+    for (int k = 0; k < group_count; k++) {
+        int4 offset = offsets[group_start + k];
+        int offset_x = offset.x;
+        int offset_y = offset.y;
+        int offset_t = offset.z;
+
+        const float * buffer_bwd = buffer_bwd_base + k * frame_buffer_elems;
+        const float * buffer_fwd = offset.w ? buffer_fwd_base + k * frame_buffer_elems : buffer_bwd;
+
+        float center_weight = buffer_bwd[y * buffer_stride + x];
+        float mirror_weight = buffer_fwd[clamp_y(y - offset_y) * buffer_stride + clamp_x(x - offset_x)];
+
+        max_w = fmaxf(max_w, fmaxf(center_weight, mirror_weight));
+        weight_sum += center_weight + mirror_weight;
+
+        #pragma unroll
+        for (int plane = 0; plane < num_planes; plane++) {
+            auto north_west = static_cast<float>(src[((offset_t * num_planes + plane) * height + clamp_y(y + offset_y)) * image_stride + clamp_x(x + offset_x)]);
+            auto south_east = static_cast<float>(src[((-offset_t * num_planes + plane) * height + clamp_y(y - offset_y)) * image_stride + clamp_x(x - offset_x)]);
+            acc[plane] += center_weight * north_west + mirror_weight * south_east;
+        }
+    }
+
+    int idx = y * buffer_stride + x;
+    max_weight[idx] = fmaxf(max_weight[idx], max_w);
+    weight[idx] += weight_sum;
+    #pragma unroll
     for (int plane = 0; plane < num_planes; plane++) {
-        auto north_west = static_cast<float>(src[((offset_t * num_planes + plane) * height + clamp_y(y + offset_y)) * image_stride + clamp_x(x + offset_x)]);
-        auto south_east = static_cast<float>(src[((-offset_t * num_planes + plane) * height + clamp_y(y - offset_y)) * image_stride + clamp_x(x - offset_x)]);
-        wdst[(plane * height + y) * buffer_stride + x] += center_weight * north_west + mirror_weight * south_east;
+        wdst[(plane * height + y) * buffer_stride + x] += acc[plane];
     }
 }
 
-static void accumulation_dispatch(
+static void accumulation_grouped_dispatch(
     float * wdst,
     float * weight,
     float * max_weight,
     const void * src, int src_offset,
-    const float * buffer_bwd,
-    const float * buffer_fwd,
+    const float * buffer_bwd_base,
+    const float * buffer_fwd_base,
+    const int4 * offsets, int group_start, int group_count,
+    int frame_buffer_elems,
     int width, int height, int image_stride, int buffer_stride,
-    int offset_x, int offset_y, int offset_t,
     int num_planes,
-    dim3 grid, dim3 block, size_t dyn_smem_size, cudaStream_t stream,
+    dim3 grid, dim3 block, cudaStream_t stream,
     bool is_float, int bits_per_sample
 ) {
+
+    #define LAUNCH(T, planes)                                                  \
+        accumulation_grouped<T, planes><<<grid, block, 0, stream>>>(           \
+            wdst, weight, max_weight,                                          \
+            static_cast<const T *>(src) + src_offset,                          \
+            buffer_bwd_base, buffer_fwd_base,                                  \
+            offsets, group_start, group_count, frame_buffer_elems,             \
+            width, height, image_stride, buffer_stride)
+
     if (is_float) {
         if (bits_per_sample == 32) {
-            accumulation<float><<<grid, block, dyn_smem_size, stream>>>(
-                wdst,
-                weight,
-                max_weight,
-                static_cast<const float *>(src) + src_offset,
-                buffer_bwd,
-                buffer_fwd,
-                width, height, image_stride, buffer_stride,
-                offset_x, offset_y, offset_t,
-                num_planes
-            );
+            switch (num_planes) {
+                case 1: LAUNCH(float, 1); break;
+                case 2: LAUNCH(float, 2); break;
+                case 3: LAUNCH(float, 3); break;
+                default: break;
+            }
         }
-    } else {
-        if (bits_per_sample <= 8) {
-            accumulation<uint8_t><<<grid, block, dyn_smem_size, stream>>>(
-                wdst,
-                weight,
-                max_weight,
-                static_cast<const uint8_t *>(src) + src_offset,
-                buffer_bwd,
-                buffer_fwd,
-                width, height, image_stride, buffer_stride,
-                offset_x, offset_y, offset_t,
-                num_planes
-            );
-        } else if (bits_per_sample <= 16) {
-            accumulation<uint16_t><<<grid, block, dyn_smem_size, stream>>>(
-                wdst,
-                weight,
-                max_weight,
-                static_cast<const uint16_t *>(src) + src_offset,
-                buffer_bwd,
-                buffer_fwd,
-                width, height, image_stride, buffer_stride,
-                offset_x, offset_y, offset_t,
-                num_planes
-            );
+    } else if (bits_per_sample <= 8) {
+        switch (num_planes) {
+            case 1: LAUNCH(uint8_t, 1); break;
+            case 2: LAUNCH(uint8_t, 2); break;
+            case 3: LAUNCH(uint8_t, 3); break;
+            default: break;
+        }
+    } else if (bits_per_sample <= 16) {
+        switch (num_planes) {
+            case 1: LAUNCH(uint16_t, 1); break;
+            case 2: LAUNCH(uint16_t, 2); break;
+            case 3: LAUNCH(uint16_t, 3); break;
+            default: break;
         }
     }
+
+    #undef LAUNCH
 }
 
 template <typename T>
@@ -416,10 +437,14 @@ cudaError_t nlmeans(
     float * d_wdst,
     float * d_weight,
     float * d_max_weight,
+    const int4 * d_offsets,
+    const int4 * h_offsets,
+    int num_offsets,
+    int group_size,
     bool is_float,
     int bits_per_sample,
     int width, int height, int image_stride, int buffer_stride,
-    int radius, int spatial_radius, int block_radius, float h2_inv_norm,
+    int radius, int block_radius, float h2_inv_norm,
     ChannelMode channels, int wmode, float wref, bool has_ref,
     cudaStream_t stream
 ) {
@@ -457,18 +482,44 @@ cudaError_t nlmeans(
     dim3 vrt_grid { (width + block.x - 1) / block.x, (height + vrt_result * block.y - 1) / (vrt_result * block.y), 1 };
     auto vrt_smem = (vrt_result * block.y + 2 * block_radius) * block.x * sizeof(float);
 
-    for (int offset_t = -radius; offset_t <= 0; offset_t++) {
-        for (int offset_y = -spatial_radius; offset_y <= spatial_radius; offset_y++) {
-            for (int offset_x = -spatial_radius; offset_x <= spatial_radius; offset_x++) {
-                if ((offset_t * (2 * spatial_radius + 1) + offset_y) * (2 * spatial_radius + 1) + offset_x >= 0) {
-                    continue;
-                }
+    int frame_buffer_elems = height * buffer_stride;
+    int center_base = (has_ref * (2 * radius + 1) + radius) * num_planes * height * image_stride;
+    int src_center = radius * num_planes * height * image_stride;
 
+    for (int group_start = 0; group_start < num_offsets; group_start += group_size) {
+        int group_count = std::min(group_size, num_offsets - group_start);
+
+        for (int k = 0; k < group_count; k++) {
+            int4 offset = h_offsets[group_start + k];
+            int offset_x = offset.x;
+            int offset_y = offset.y;
+            int offset_t = offset.z;
+
+            distance_horizontal_dispatch<hrz_result>(
+                d_buffer,
+                d_src,
+                center_base,
+                center_base + offset_t * num_planes * height * image_stride,
+                width, height, image_stride, buffer_stride,
+                offset_x, offset_y,
+                block_radius, channels,
+                hrz_grid, block, hrz_smem, stream,
+                is_float, bits_per_sample
+            );
+
+            vertical<vrt_result><<<vrt_grid, block, vrt_smem, stream>>>(
+                d_buffer_bwd + k * frame_buffer_elems,
+                d_buffer,
+                width, height, buffer_stride,
+                block_radius, h2_inv_norm, wmode
+            );
+
+            if (offset.w) {
                 distance_horizontal_dispatch<hrz_result>(
                     d_buffer,
                     d_src,
-                    (has_ref * (2 * radius + 1) + radius) * num_planes * height * image_stride,
-                    ((has_ref * (2 * radius + 1) + radius) + offset_t) * num_planes * height * image_stride,
+                    center_base - offset_t * num_planes * height * image_stride,
+                    center_base,
                     width, height, image_stride, buffer_stride,
                     offset_x, offset_y,
                     block_radius, channels,
@@ -477,57 +528,25 @@ cudaError_t nlmeans(
                 );
 
                 vertical<vrt_result><<<vrt_grid, block, vrt_smem, stream>>>(
-                    d_buffer_bwd,
+                    d_buffer_fwd + k * frame_buffer_elems,
                     d_buffer,
                     width, height, buffer_stride,
                     block_radius, h2_inv_norm, wmode
-                );
-
-                if (offset_t == 0) {
-                    accumulation_dispatch(
-                        d_wdst, d_weight, d_max_weight,
-                        d_src, radius * num_planes * height * image_stride,
-                        d_buffer_bwd, d_buffer_bwd,
-                        width, height, image_stride, buffer_stride,
-                        offset_x, offset_y, offset_t,
-                        num_planes,
-                        grid, block, 0, stream,
-                        is_float, bits_per_sample
-                    );
-                    continue;
-                }
-
-                distance_horizontal_dispatch<hrz_result>(
-                    d_buffer,
-                    d_src,
-                    ((has_ref * (2 * radius + 1) + radius) - offset_t) * num_planes * height * image_stride,
-                    (has_ref * (2 * radius + 1) + radius) * num_planes * height * image_stride,
-                    width, height, image_stride, buffer_stride,
-                    offset_x, offset_y,
-                    block_radius, channels,
-                    hrz_grid, block, hrz_smem, stream,
-                    is_float, bits_per_sample
-                );
-
-                vertical<vrt_result><<<vrt_grid, block, vrt_smem, stream>>>(
-                    d_buffer_fwd,
-                    d_buffer,
-                    width, height, buffer_stride,
-                    block_radius, h2_inv_norm, wmode
-                );
-
-                accumulation_dispatch(
-                    d_wdst, d_weight, d_max_weight,
-                    d_src, radius * num_planes * height * image_stride,
-                    d_buffer_bwd, d_buffer_fwd,
-                    width, height, image_stride, buffer_stride,
-                    offset_x, offset_y, offset_t,
-                    num_planes,
-                    grid, block, 0, stream,
-                    is_float, bits_per_sample
                 );
             }
         }
+
+        accumulation_grouped_dispatch(
+            d_wdst, d_weight, d_max_weight,
+            d_src, src_center,
+            d_buffer_bwd, d_buffer_fwd,
+            d_offsets, group_start, group_count,
+            frame_buffer_elems,
+            width, height, image_stride, buffer_stride,
+            num_planes,
+            grid, block, stream,
+            is_float, bits_per_sample
+        );
     }
 
     finish_dispatch(

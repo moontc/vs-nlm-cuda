@@ -11,10 +11,14 @@ extern cudaError_t nlmeans(
     float * d_wdst,
     float * d_weight,
     float * d_max_weight,
+    const int4 * d_offsets,
+    const int4 * h_offsets,
+    int num_offsets,
+    int group_size,
     bool is_float,
     int bits_per_sample,
     int width, int height, int image_stride, int buffer_stride,
-    int radius, int spatial_radius, int block_radius, float h2_inv_norm,
+    int radius, int block_radius, float h2_inv_norm,
     ChannelMode channels, int wmode, float wref, bool has_ref,
     cudaStream_t stream
 );

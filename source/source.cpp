@@ -206,11 +206,18 @@ struct NLMeansData {
     VSNodeRef * ref_node; // rclip
     int device_id;
 
+    std::vector<int4> h_offsets;
+    Resource<int4 *, cudaFreeCustom> d_offsets; // device copy of h_offsets
+    int num_offsets;
+    int group_size; // offsets accumulated per grouped accumulation launch
+
     ticket_semaphore semaphore;
     std::vector<NLMeansStreamData> stream_data;
     std::vector<int> ticket;
     std::mutex ticket_lock;
 };
+
+static constexpr size_t group_buffer_cap_bytes = size_t { 256 } << 20;
 
 static void VS_CC NLMeansInit(
     VSMap *in, VSMap *out, void **instanceData, VSNode *node,
@@ -339,6 +346,10 @@ static const VSFrameRef *VS_CC NLMeansGetFrame(
             stream_data.d_wdst,
             stream_data.d_weight,
             stream_data.d_max_weight,
+            d->d_offsets,
+            d->h_offsets.data(),
+            d->num_offsets,
+            d->group_size,
             vi->format->sampleType == stFloat,
             vi->format->bitsPerSample,
             filter_width,
@@ -346,7 +357,6 @@ static const VSFrameRef *VS_CC NLMeansGetFrame(
             stream_data.image_stride,
             stream_data.buffer_stride,
             d->radius,
-            d->spatial_radius,
             d->block_radius,
             d->h2_inv_norm,
             d->channels,
@@ -563,6 +573,24 @@ static void VS_CC NLMeansCreate(
 
     auto [filter_num_planes, filter_width, filter_height] = get_filter_shape(d->channels, vi);
 
+    for (int offset_t = -d->radius; offset_t <= 0; offset_t++) {
+        for (int offset_y = -d->spatial_radius; offset_y <= d->spatial_radius; offset_y++) {
+            for (int offset_x = -d->spatial_radius; offset_x <= d->spatial_radius; offset_x++) {
+                if ((offset_t * (2 * d->spatial_radius + 1) + offset_y) * (2 * d->spatial_radius + 1) + offset_x >= 0) {
+                    continue;
+                }
+                d->h_offsets.push_back(int4 { offset_x, offset_y, offset_t, offset_t != 0 ? 1 : 0 });
+            }
+        }
+    }
+    d->num_offsets = static_cast<int>(d->h_offsets.size());
+
+    checkError(cudaMalloc(&d->d_offsets.data, d->num_offsets * sizeof(int4)));
+    checkError(cudaMemcpy(
+        d->d_offsets.data, d->h_offsets.data(),
+        d->num_offsets * sizeof(int4), cudaMemcpyHostToDevice
+    ));
+
     d->stream_data.resize(num_streams);
     for (int i = 0; i < num_streams; i++) {
         auto & stream_data = d->stream_data[i];
@@ -589,10 +617,17 @@ static void VS_CC NLMeansCreate(
         checkError(cudaMallocPitch(&stream_data.d_max_weight.data, &buffer_pitch, filter_width * sizeof(float), filter_height));
         stream_data.buffer_stride = static_cast<int>(buffer_pitch / sizeof(float));
 
+        if (i == 0) {
+            size_t frame_bytes = filter_height * buffer_pitch;
+            int buffers_per_slot = (d->radius > 0) ? 2 : 1;
+            auto budget = group_buffer_cap_bytes / (frame_bytes * buffers_per_slot);
+            d->group_size = std::clamp(static_cast<int>(budget), 1, d->num_offsets);
+        }
+
         checkError(cudaMalloc(&stream_data.d_buffer.data, filter_height * buffer_pitch));
-        checkError(cudaMalloc(&stream_data.d_buffer_bwd.data, filter_height * buffer_pitch));
+        checkError(cudaMalloc(&stream_data.d_buffer_bwd.data, d->group_size * filter_height * buffer_pitch));
         if (d->radius > 0) {
-            checkError(cudaMalloc(&stream_data.d_buffer_fwd.data, filter_height * buffer_pitch));
+            checkError(cudaMalloc(&stream_data.d_buffer_fwd.data, d->group_size * filter_height * buffer_pitch));
         }
         checkError(cudaMalloc(&stream_data.d_wdst.data, filter_num_planes * filter_height * buffer_pitch));
         checkError(cudaMalloc(&stream_data.d_weight.data, filter_height * buffer_pitch));
